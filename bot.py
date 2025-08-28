@@ -3,7 +3,8 @@ import asyncio
 import threading
 import re
 import time
-import shutil  # Import the shutil module for directory removal
+import shutil
+import sys  # Import the sys module to get the Python executable path
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
@@ -30,7 +31,7 @@ class ProgressCallbackFile:
         if data:
             self._bytes_read += len(data)
             current_time = time.time()
-            if current_time - self._last_update_time > 2:  # Update every 2 seconds
+            if current_time - self._last_update_time > 2:
                 self._last_update_time = current_time
                 asyncio.run_coroutine_threadsafe(
                     self._update_telegram_message(), self._loop
@@ -39,7 +40,7 @@ class ProgressCallbackFile:
 
     async def _update_telegram_message(self):
         try:
-            percent = (self._bytes_read / self._total_size) * 100
+            percent = (self._bytes_read / self._total_size) * 100 if self._total_size > 0 else 0
             progress_bar = f"[{'█' * int(percent // 10)}{' ' * (10 - int(percent // 10))}]"
             read_mb = self._bytes_read / 1024 / 1024
             total_mb = self._total_size / 1024 / 1024
@@ -98,12 +99,10 @@ async def message_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # --- DOWNLOAD LOGIC ---
 
 async def read_stream_and_update_progress(stream, context, chat_id, message_id):
-    """Reads stdout from subprocess and updates the download progress message."""
     last_update_time = 0
     while not stream.at_eof():
         line_bytes = await stream.readline()
-        if not line_bytes:
-            break
+        if not line_bytes: break
         line = line_bytes.decode('utf-8', errors='ignore').strip()
 
         match = re.search(
@@ -143,9 +142,10 @@ async def download_and_upload(update: Update, context: ContextTypes.DEFAULT_TYPE
     files_before = set(os.listdir('.'))
     
     try:
-        # ===== FIX 1: Execute spotdl as a module to ensure it's found =====
+        # ===== THE ULTIMATE FIX: Use the full path to the Python executable =====
+        python_executable = sys.executable
         command = (
-            f'python -m spotdl download "{url}" --lyrics genius --ignore-albums '
+            f'{python_executable} -m spotdl download "{url}" --lyrics genius --ignore-albums '
             '--yt-dlp-args "--cookies cookies.txt" --format mp3 --bitrate 320k'
         )
         
@@ -161,8 +161,9 @@ async def download_and_upload(update: Update, context: ContextTypes.DEFAULT_TYPE
         if process.returncode != 0:
             stderr_output = (await process.stderr.read()).decode()
             print(f"Error downloading: {stderr_output}")
+            error_message = f"❌ Download failed.\n\n`{stderr_output[-400:]}`" # Show last 400 chars of error
             await context.bot.edit_message_text(
-                chat_id=chat_id, message_id=status_message.message_id, text=f"❌ Download failed.\n`{stderr_output}`"
+                chat_id=chat_id, message_id=status_message.message_id, text=error_message, parse_mode='Markdown'
             )
             return
 
@@ -201,15 +202,14 @@ async def download_and_upload(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
     
     finally:
-        # ===== FIX 2: Correctly remove files and directories =====
         files_after_cleanup = set(os.listdir('.'))
         files_to_delete = files_after_cleanup - files_before
         for filename in files_to_delete:
             try:
                 if os.path.isdir(filename):
-                    shutil.rmtree(filename)  # Use this for directories
+                    shutil.rmtree(filename)
                 else:
-                    os.remove(filename)      # Use this for files
+                    os.remove(filename)
             except OSError as e:
                 print(f"Error deleting {filename}: {e}")
 
