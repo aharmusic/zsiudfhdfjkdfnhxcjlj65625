@@ -14,7 +14,7 @@ TELEGRAM_BOT_TOKEN = "8443350946:AAHmWA5jxxX3HfuxmZtMhQw_nHU-4f-EjVk"
 ADMIN_CHAT_ID = "7962617461"
 PORT = int(os.environ.get('PORT', 8080))
 
-# --- 1. THE WEB SERVER ---
+# --- 1. THE WEB SERVER (TO KEEP KOYEB HAPPY) ---
 flask_app = Flask(__name__)
 @flask_app.route('/')
 def health_check():
@@ -25,10 +25,11 @@ def run_flask():
 # --- 2. THE TELEGRAM BOT LOGIC ---
 class ProgressCallbackFile:
     def __init__(self, filepath, loop, context, chat_id, message_id):
-        self._filepath = filepath; self._loop = loop; self._context = context
-        self._chat_id = chat_id; self._message_id = message_id
-        self._file = open(filepath, 'rb'); self._total_size = os.path.getsize(filepath)
-        self._bytes_read = 0; self._last_update_time = 0
+        self._filepath, self._loop, self._context = filepath, loop, context
+        self._chat_id, self._message_id = chat_id, message_id
+        self._file = open(filepath, 'rb')
+        self._total_size = os.path.getsize(filepath)
+        self._bytes_read, self._last_update_time = 0, 0
     def read(self, size=-1):
         data = self._file.read(size)
         if data:
@@ -61,12 +62,13 @@ async def message_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try: await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=forward_text); await update.message.reply_text("Your message has been sent to the admin.")
     except Exception as e: print(f"Error sending message to admin: {e}"); await update.message.reply_text("Sorry, I could not send your message.")
 
-async def read_stream_and_update_progress(stream, context, chat_id, message_id):
+async def log_and_parse_stream(stream, context, chat_id, message_id):
     last_update_time = 0
     while not stream.at_eof():
-        line_bytes = await stream.readline();
+        line_bytes = await stream.readline()
         if not line_bytes: break
         line = line_bytes.decode('utf-8', errors='ignore').strip()
+        print(f"[SPOTDL_INFO] {line}")
         match = re.search(r'\[download\]\s+(?P<percent>\d+\.\d+)% of\s+(?P<size>~?\d+\.\d+\w+)\s+at\s+(?P<speed>.*?)\s+ETA\s+(?P<eta>.*)', line)
         if match:
             current_time = time.time()
@@ -77,6 +79,13 @@ async def read_stream_and_update_progress(stream, context, chat_id, message_id):
                 try: await context.bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=progress_text, parse_mode='Markdown')
                 except Exception: pass
 
+async def log_stderr_stream(stream):
+    while not stream.at_eof():
+        line_bytes = await stream.readline()
+        if not line_bytes: break
+        line = line_bytes.decode('utf-8', errors='ignore').strip()
+        print(f"[SPOTDL_ERROR] {line}")
+
 def run_download_in_thread(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str):
     loop = asyncio.new_event_loop(); asyncio.set_event_loop(loop)
     loop.run_until_complete(download_and_upload(update, context, url))
@@ -86,19 +95,21 @@ async def download_and_upload(update: Update, context: ContextTypes.DEFAULT_TYPE
     chat_id = update.effective_chat.id; files_before = set(os.listdir('.'))
     try:
         python_executable = sys.executable
-        # === FINAL COMMAND with --no-cache ===
+        # === COMMAND WITH COOKIES ARGUMENT RE-ADDED ===
         command = (f'{python_executable} -m spotdl download "{url}" --lyrics genius --ignore-albums '
                    '--yt-dlp-args "--cookies cookies.txt" --format mp3 --bitrate 320k --no-cache')
         
         process = await asyncio.create_subprocess_shell(command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-        await read_stream_and_update_progress(process.stdout, context, chat_id, status_message.message_id)
-        stdout, stderr = await process.communicate()
+        stdout_task = asyncio.create_task(log_and_parse_stream(process.stdout, context, chat_id, status_message.message_id))
+        stderr_task = asyncio.create_task(log_stderr_stream(process.stderr))
+        await process.wait()
+        await asyncio.gather(stdout_task, stderr_task)
+
         if process.returncode != 0:
-            error_output = stderr.decode()
-            print(f"--- SPOTDL ERROR --- \n{error_output}\n--- END SPOTDL ERROR ---")
-            error_message = f"❌ Download failed.\n\n`{error_output[-400:]}`"
-            await context.bot.edit_message_text(chat_id=chat_id, message_id=status_message.message_id, text=error_message, parse_mode='Markdown')
+            error_message = f"❌ Download failed. Please check the deployment logs for details."
+            await context.bot.edit_message_text(chat_id=chat_id, message_id=status_message.message_id, text=error_message)
             return
+
         files_after = set(os.listdir('.')); new_files = files_after - files_before
         if not new_files: await context.bot.edit_message_text(chat_id=chat_id, message_id=status_message.message_id, text="❌ Download finished, but no new files were found."); return
         current_loop = asyncio.get_running_loop()
@@ -112,8 +123,7 @@ async def download_and_upload(update: Update, context: ContextTypes.DEFAULT_TYPE
         await context.bot.delete_message(chat_id=chat_id, message_id=status_message.message_id)
     except Exception as e: print(f"An unexpected error occurred: {e}"); await context.bot.edit_message_text(chat_id=chat_id, message_id=status_message.message_id, text="❌ An unexpected error occurred.")
     finally:
-        files_after_cleanup = set(os.listdir('.'))
-        files_to_delete = files_after_cleanup - files_before
+        files_after_cleanup = set(os.listdir('.')); files_to_delete = files_after_cleanup - files_before
         for filename in files_to_delete:
             try:
                 if os.path.isdir(filename): shutil.rmtree(filename)
