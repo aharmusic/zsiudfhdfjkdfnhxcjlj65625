@@ -3,6 +3,7 @@ import asyncio
 import threading
 import re
 import time
+import shutil  # Import the shutil module for directory removal
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
@@ -55,11 +56,9 @@ class ProgressCallbackFile:
                 parse_mode='Markdown'
             )
         except Exception:
-            # Ignore errors like "message is not modified"
             pass
             
     def __getattr__(self, name):
-        # Forward other attribute lookups to the file object
         return getattr(self._file, name)
         
     def __len__(self):
@@ -107,7 +106,6 @@ async def read_stream_and_update_progress(stream, context, chat_id, message_id):
             break
         line = line_bytes.decode('utf-8', errors='ignore').strip()
 
-        # Regex to capture yt-dlp's progress line
         match = re.search(
             r'\[download\]\s+(?P<percent>\d+\.\d+)% of\s+(?P<size>~?\d+\.\d+\w+)\s+at\s+(?P<speed>.*?)\s+ETA\s+(?P<eta>.*)',
             line
@@ -115,7 +113,7 @@ async def read_stream_and_update_progress(stream, context, chat_id, message_id):
         
         if match:
             current_time = time.time()
-            if current_time - last_update_time > 2: # Rate limit updates
+            if current_time - last_update_time > 2:
                 last_update_time = current_time
                 percent = float(match.group('percent'))
                 progress_bar = f"[{'█' * int(percent // 10)}{' ' * (10 - int(percent // 10))}]"
@@ -145,8 +143,9 @@ async def download_and_upload(update: Update, context: ContextTypes.DEFAULT_TYPE
     files_before = set(os.listdir('.'))
     
     try:
+        # ===== FIX 1: Execute spotdl as a module to ensure it's found =====
         command = (
-            f'spotdl download "{url}" --lyrics genius --ignore-albums '
+            f'python -m spotdl download "{url}" --lyrics genius --ignore-albums '
             '--yt-dlp-args "--cookies cookies.txt" --format mp3 --bitrate 320k'
         )
         
@@ -156,7 +155,6 @@ async def download_and_upload(update: Update, context: ContextTypes.DEFAULT_TYPE
             stderr=asyncio.subprocess.PIPE
         )
         
-        # Run the stream reader and process waiter concurrently
         await read_stream_and_update_progress(process.stdout, context, chat_id, status_message.message_id)
         await process.wait()
 
@@ -164,7 +162,7 @@ async def download_and_upload(update: Update, context: ContextTypes.DEFAULT_TYPE
             stderr_output = (await process.stderr.read()).decode()
             print(f"Error downloading: {stderr_output}")
             await context.bot.edit_message_text(
-                chat_id=chat_id, message_id=status_message.message_id, text="❌ Download failed."
+                chat_id=chat_id, message_id=status_message.message_id, text=f"❌ Download failed.\n`{stderr_output}`"
             )
             return
 
@@ -177,7 +175,6 @@ async def download_and_upload(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
             return
         
-        # Get the current event loop for the upload progress wrapper
         current_loop = asyncio.get_running_loop()
 
         for filename in new_files:
@@ -193,7 +190,7 @@ async def download_and_upload(update: Update, context: ContextTypes.DEFAULT_TYPE
                 print(f"Error uploading {filename}: {e}")
                 await context.bot.send_message(chat_id=chat_id, text=f"Could not upload {filename}.")
             finally:
-                progress_wrapper.close() # Ensure the file is closed
+                progress_wrapper.close()
 
         await context.bot.delete_message(chat_id=chat_id, message_id=status_message.message_id)
 
@@ -204,14 +201,17 @@ async def download_and_upload(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
     
     finally:
-        # Clean up all new files
+        # ===== FIX 2: Correctly remove files and directories =====
         files_after_cleanup = set(os.listdir('.'))
         files_to_delete = files_after_cleanup - files_before
         for filename in files_to_delete:
             try:
-                os.remove(filename)
+                if os.path.isdir(filename):
+                    shutil.rmtree(filename)  # Use this for directories
+                else:
+                    os.remove(filename)      # Use this for files
             except OSError as e:
-                print(f"Error deleting file {filename}: {e}")
+                print(f"Error deleting {filename}: {e}")
 
 async def download_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
