@@ -12,28 +12,17 @@ from flask import Flask
 # --- CONFIGURATION ---
 TELEGRAM_BOT_TOKEN = "8443350946:AAHmWA5jxxX3HfuxmZtMhQw_nHU-4f-EjVk"
 ADMIN_CHAT_ID = "7962617461"
-# Koyeb provides the port to run on via the PORT environment variable
 PORT = int(os.environ.get('PORT', 8080))
 
-# --- 1. THE WEB SERVER (TO KEEP KOYEB HAPPY) ---
-
-# Create a simple Flask app
+# --- 1. THE WEB SERVER ---
 flask_app = Flask(__name__)
-
 @flask_app.route('/')
 def health_check():
-    """This route is called by Koyeb's health checker."""
     return "Bot is alive and running!", 200
-
 def run_flask():
-    """Runs the Flask app."""
-    # The host must be '0.0.0.0' to be reachable by Koyeb
     flask_app.run(host='0.0.0.0', port=PORT)
 
-
-# --- 2. THE TELEGRAM BOT LOGIC (YOUR EXISTING CODE) ---
-
-# (The ProgressCallbackFile class and other bot functions remain exactly the same)
+# --- 2. THE TELEGRAM BOT LOGIC ---
 class ProgressCallbackFile:
     def __init__(self, filepath, loop, context, chat_id, message_id):
         self._filepath = filepath; self._loop = loop; self._context = context
@@ -97,7 +86,10 @@ async def download_and_upload(update: Update, context: ContextTypes.DEFAULT_TYPE
     chat_id = update.effective_chat.id; files_before = set(os.listdir('.'))
     try:
         python_executable = sys.executable
-        command = (f'{python_executable} -m spotdl download "{url}" --lyrics genius --ignore-albums --yt-dlp-args "--cookies cookies.txt" --format mp3 --bitrate 320k')
+        # === FINAL COMMAND with --no-cache ===
+        command = (f'{python_executable} -m spotdl download "{url}" --lyrics genius --ignore-albums '
+                   '--yt-dlp-args "--cookies cookies.txt" --format mp3 --bitrate 320k --no-cache')
+        
         process = await asyncio.create_subprocess_shell(command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
         await read_stream_and_update_progress(process.stdout, context, chat_id, status_message.message_id)
         stdout, stderr = await process.communicate()
@@ -134,7 +126,6 @@ async def download_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     threading.Thread(target=run_download_in_thread, args=(update, context, url)).start()
 
 def run_bot():
-    """Builds and runs the Telegram bot."""
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
@@ -143,16 +134,9 @@ def run_bot():
     print("Bot is running...")
     application.run_polling()
 
-
 # --- 3. THE MAIN STARTER ---
-
 if __name__ == '__main__':
-    # Create a thread for the Flask web server
     flask_thread = threading.Thread(target=run_flask)
     flask_thread.daemon = True
-    
-    # Start the web server thread in the background
     flask_thread.start()
-    
-    # Run the bot in the main thread
     run_bot()
