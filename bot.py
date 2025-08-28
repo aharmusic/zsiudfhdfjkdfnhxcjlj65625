@@ -8,6 +8,8 @@ import sys
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 from flask import Flask
+from mutagen.mp3 import MP3
+from mutagen.id3 import TIT2, TPE1
 
 # --- CONFIGURATION ---
 TELEGRAM_BOT_TOKEN = "8443350946:AAHmWA5jxxX3HfuxmZtMhQw_nHU-4f-EjVk"
@@ -27,8 +29,7 @@ class ProgressCallbackFile:
     def __init__(self, filepath, loop, context, chat_id, message_id):
         self._filepath, self._loop, self._context = filepath, loop, context
         self._chat_id, self._message_id = chat_id, message_id
-        self._file = open(filepath, 'rb')
-        self._total_size = os.path.getsize(filepath)
+        self._file = open(filepath, 'rb'); self._total_size = os.path.getsize(filepath)
         self._bytes_read, self._last_update_time = 0, 0
     def read(self, size=-1):
         data = self._file.read(size)
@@ -65,7 +66,7 @@ async def message_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def log_and_parse_stream(stream, context, chat_id, message_id):
     last_update_time = 0
     while not stream.at_eof():
-        line_bytes = await stream.readline()
+        line_bytes = await stream.readline();
         if not line_bytes: break
         line = line_bytes.decode('utf-8', errors='ignore').strip()
         print(f"[SPOTDL_INFO] {line}")
@@ -81,7 +82,7 @@ async def log_and_parse_stream(stream, context, chat_id, message_id):
 
 async def log_stderr_stream(stream):
     while not stream.at_eof():
-        line_bytes = await stream.readline()
+        line_bytes = await stream.readline();
         if not line_bytes: break
         line = line_bytes.decode('utf-8', errors='ignore').strip()
         print(f"[SPOTDL_ERROR] {line}")
@@ -95,31 +96,51 @@ async def download_and_upload(update: Update, context: ContextTypes.DEFAULT_TYPE
     chat_id = update.effective_chat.id; files_before = set(os.listdir('.'))
     try:
         python_executable = sys.executable
-        # === COMMAND WITH COOKIES ARGUMENT RE-ADDED ===
         command = (f'{python_executable} -m spotdl download "{url}" --lyrics genius --ignore-albums '
                    '--yt-dlp-args "--cookies cookies.txt" --format mp3 --bitrate 320k --no-cache')
         
         process = await asyncio.create_subprocess_shell(command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
         stdout_task = asyncio.create_task(log_and_parse_stream(process.stdout, context, chat_id, status_message.message_id))
         stderr_task = asyncio.create_task(log_stderr_stream(process.stderr))
-        await process.wait()
-        await asyncio.gather(stdout_task, stderr_task)
+        await process.wait(); await asyncio.gather(stdout_task, stderr_task)
 
         if process.returncode != 0:
-            error_message = f"❌ Download failed. Please check the deployment logs for details."
-            await context.bot.edit_message_text(chat_id=chat_id, message_id=status_message.message_id, text=error_message)
-            return
+            await context.bot.edit_message_text(chat_id=chat_id, message_id=status_message.message_id, text="❌ Download failed. Check logs."); return
 
         files_after = set(os.listdir('.')); new_files = files_after - files_before
-        if not new_files: await context.bot.edit_message_text(chat_id=chat_id, message_id=status_message.message_id, text="❌ Download finished, but no new files were found."); return
+        
+        # --- NEW UPLOAD LOGIC ---
+        mp3_file_path = next((f for f in new_files if f.endswith('.mp3')), None)
+        lrc_file_path = next((f for f in new_files if f.endswith('.lrc')), None)
+
+        if not mp3_file_path:
+            await context.bot.edit_message_text(chat_id=chat_id, message_id=status_message.message_id, text="❌ Download finished, but MP3 file not found."); return
+
+        # Read metadata from the MP3 file
+        try:
+            audio = MP3(mp3_file_path)
+            duration = int(audio.info.length)
+            # Safely get title and artist from ID3 tags, with fallbacks
+            title = str(audio.get('TIT2', "Unknown Title"))
+            artist = str(audio.get('TPE1', "Unknown Artist"))
+        except Exception as e:
+            print(f"Mutagen error: {e}. Using fallback values.")
+            duration, title, artist = None, "Unknown Title", "Unknown Artist"
+
         current_loop = asyncio.get_running_loop()
-        for filename in new_files:
-            try:
-                progress_wrapper = ProgressCallbackFile(filename, current_loop, context, chat_id, status_message.message_id)
-                if filename.endswith(".mp3"): await context.bot.send_audio(chat_id=chat_id, audio=progress_wrapper)
-                elif filename.endswith(".lrc"): await context.bot.send_document(chat_id=chat_id, document=progress_wrapper)
-            except Exception as e: print(f"Error uploading {filename}: {e}"); await context.bot.send_message(chat_id=chat_id, text=f"Could not upload {filename}.")
-            finally: progress_wrapper.close()
+        
+        # Upload Audio with correct metadata
+        progress_wrapper_audio = ProgressCallbackFile(mp3_file_path, current_loop, context, chat_id, status_message.message_id)
+        try:
+            await context.bot.send_audio(chat_id=chat_id, audio=progress_wrapper_audio, duration=duration, title=title, performer=artist)
+        finally:
+            progress_wrapper_audio.close()
+
+        # Upload Lyrics if they exist
+        if lrc_file_path:
+            with open(lrc_file_path, 'rb') as lrc_file:
+                await context.bot.send_document(chat_id=chat_id, document=lrc_file)
+
         await context.bot.delete_message(chat_id=chat_id, message_id=status_message.message_id)
     except Exception as e: print(f"An unexpected error occurred: {e}"); await context.bot.edit_message_text(chat_id=chat_id, message_id=status_message.message_id, text="❌ An unexpected error occurred.")
     finally:
