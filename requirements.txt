@@ -3,3 +3,4 @@ spotdl
 yt-dlp
 thread
 flask
+mutagen
