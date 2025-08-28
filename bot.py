@@ -5,6 +5,7 @@ import re
 import time
 import shutil
 import sys
+from queue import Queue
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 from flask import Flask
@@ -25,6 +26,10 @@ def run_flask():
     flask_app.run(host='0.0.0.0', port=PORT)
 
 # --- 2. THE TELEGRAM BOT LOGIC ---
+
+# === NEW: THE DOWNLOAD QUEUE ===
+download_queue = Queue()
+
 class ProgressCallbackFile:
     def __init__(self, filepath, loop, context, chat_id, message_id):
         self._filepath, self._loop, self._context = filepath, loop, context
@@ -52,7 +57,8 @@ class ProgressCallbackFile:
     def close(self): self._file.close()
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Welcome! Use /dl <URL> to download a song.")
+    wel_msg = ("Welcome! Use /dl <URL> to download a song.\n (YoutubeMusic Links Aren't Supported)")
+    await update.message.reply_text(wel_msg, parse_mode='Markdown')
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     help_text = ("🎵 **Available Command** 🎵\n\n`/dl <Spotify or YouTube URL>` - Downloads the audio (and lyrics if found).\n\n`/messageadmin <message>` - Send a message to the bot admin.")
     await update.message.reply_text(help_text, parse_mode='Markdown')
@@ -87,62 +93,42 @@ async def log_stderr_stream(stream):
         line = line_bytes.decode('utf-8', errors='ignore').strip()
         print(f"[SPOTDL_ERROR] {line}")
 
-def run_download_in_thread(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str):
-    loop = asyncio.new_event_loop(); asyncio.set_event_loop(loop)
-    loop.run_until_complete(download_and_upload(update, context, url))
-
 async def download_and_upload(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str):
-    status_message = await update.message.reply_text("🚀 Initializing...")
+    status_message = await update.message.reply_text("🚀 Your request is in the queue...")
     chat_id = update.effective_chat.id; files_before = set(os.listdir('.'))
     try:
+        await context.bot.edit_message_text(chat_id=chat_id, message_id=status_message.message_id, text="🔥 Your download is starting now...")
         python_executable = sys.executable
+        # === NEW CPU-THROTTLED COMMAND ===
+        # We pass postprocessor args to yt-dlp to limit ffmpeg's threads
         command = (f'{python_executable} -m spotdl download "{url}" --lyrics genius --ignore-albums '
-                   '--yt-dlp-args "--cookies cookies.txt" --format mp3 --bitrate 320k --no-cache')
+                   '--format mp3 --bitrate 320k --no-cache '
+                   '--yt-dlp-args "--postprocessor-args \\"ffmpeg:-threads 1\\""')
         
         process = await asyncio.create_subprocess_shell(command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
         stdout_task = asyncio.create_task(log_and_parse_stream(process.stdout, context, chat_id, status_message.message_id))
         stderr_task = asyncio.create_task(log_stderr_stream(process.stderr))
         await process.wait(); await asyncio.gather(stdout_task, stderr_task)
 
-        if process.returncode != 0:
-            await context.bot.edit_message_text(chat_id=chat_id, message_id=status_message.message_id, text="❌ Download failed. Check logs."); return
-
+        if process.returncode != 0: await context.bot.edit_message_text(chat_id=chat_id, message_id=status_message.message_id, text="❌ Download failed. Check logs."); return
         files_after = set(os.listdir('.')); new_files = files_after - files_before
-        
-        # --- NEW UPLOAD LOGIC ---
         mp3_file_path = next((f for f in new_files if f.endswith('.mp3')), None)
         lrc_file_path = next((f for f in new_files if f.endswith('.lrc')), None)
+        if not mp3_file_path: await context.bot.edit_message_text(chat_id=chat_id, message_id=status_message.message_id, text="❌ MP3 file not found."); return
 
-        if not mp3_file_path:
-            await context.bot.edit_message_text(chat_id=chat_id, message_id=status_message.message_id, text="❌ Download finished, but MP3 file not found."); return
-
-        # Read metadata from the MP3 file
         try:
-            audio = MP3(mp3_file_path)
-            duration = int(audio.info.length)
-            # Safely get title and artist from ID3 tags, with fallbacks
-            title = str(audio.get('TIT2', "Unknown Title"))
-            artist = str(audio.get('TPE1', "Unknown Artist"))
-        except Exception as e:
-            print(f"Mutagen error: {e}. Using fallback values.")
-            duration, title, artist = None, "Unknown Title", "Unknown Artist"
-
-        current_loop = asyncio.get_running_loop()
+            audio = MP3(mp3_file_path); duration = int(audio.info.length)
+            title = str(audio.get('TIT2', "Unknown Title")); artist = str(audio.get('TPE1', "Unknown Artist"))
+        except Exception as e: print(f"Mutagen error: {e}"); duration, title, artist = None, "Unknown", "Unknown"
         
-        # Upload Audio with correct metadata
+        current_loop = asyncio.get_running_loop()
         progress_wrapper_audio = ProgressCallbackFile(mp3_file_path, current_loop, context, chat_id, status_message.message_id)
-        try:
-            await context.bot.send_audio(chat_id=chat_id, audio=progress_wrapper_audio, duration=duration, title=title, performer=artist)
-        finally:
-            progress_wrapper_audio.close()
-
-        # Upload Lyrics if they exist
+        try: await context.bot.send_audio(chat_id=chat_id, audio=progress_wrapper_audio, duration=duration, title=title, performer=artist)
+        finally: progress_wrapper_audio.close()
         if lrc_file_path:
-            with open(lrc_file_path, 'rb') as lrc_file:
-                await context.bot.send_document(chat_id=chat_id, document=lrc_file)
-
+            with open(lrc_file_path, 'rb') as lrc_file: await context.bot.send_document(chat_id=chat_id, document=lrc_file)
         await context.bot.delete_message(chat_id=chat_id, message_id=status_message.message_id)
-    except Exception as e: print(f"An unexpected error occurred: {e}"); await context.bot.edit_message_text(chat_id=chat_id, message_id=status_message.message_id, text="❌ An unexpected error occurred.")
+    except Exception as e: print(f"Unexpected error: {e}"); await context.bot.edit_message_text(chat_id=chat_id, message_id=status_message.message_id, text="❌ An error occurred.")
     finally:
         files_after_cleanup = set(os.listdir('.')); files_to_delete = files_after_cleanup - files_before
         for filename in files_to_delete:
@@ -151,10 +137,24 @@ async def download_and_upload(update: Update, context: ContextTypes.DEFAULT_TYPE
                 else: os.remove(filename)
             except OSError as e: print(f"Error deleting {filename}: {e}")
 
+# === NEW: DOWNLOAD WORKER THREAD ===
+def download_worker():
+    """Pulls tasks from the queue and executes them one by one."""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    while True:
+        update, context, url = download_queue.get()
+        print(f"Worker starting new download for chat {update.effective_chat.id}")
+        loop.run_until_complete(download_and_upload(update, context, url))
+        download_queue.task_done()
+
 async def download_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args: await update.message.reply_text("Please provide a URL. Usage: /dl <url>"); return
+    """Adds a new download request to the queue."""
+    if not context.args: await update.message.reply_text("Please provide a URL."); return
     url = context.args[0]
-    threading.Thread(target=run_download_in_thread, args=(update, context, url)).start()
+    # Put the necessary objects into the queue
+    download_queue.put((update, context, url))
+    await update.message.reply_text("✅ Your request has been added to the download queue.")
 
 def run_bot():
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
@@ -167,7 +167,15 @@ def run_bot():
 
 # --- 3. THE MAIN STARTER ---
 if __name__ == '__main__':
+    # Start the Flask web server in a background thread
     flask_thread = threading.Thread(target=run_flask)
     flask_thread.daemon = True
     flask_thread.start()
+
+    # Start the single download worker in a background thread
+    worker_thread = threading.Thread(target=download_worker)
+    worker_thread.daemon = True
+    worker_thread.start()
+
+    # Run the bot in the main thread
     run_bot()
