@@ -17,7 +17,7 @@ TELEGRAM_BOT_TOKEN = "8443350946:AAHmWA5jxxX3HfuxmZtMhQw_nHU-4f-EjVk"
 ADMIN_CHAT_ID = "7962617461"
 PORT = int(os.environ.get('PORT', 8080))
 
-# --- 1. THE WEB SERVER (TO KEEP KOYEB HAPPY) ---
+# --- 1. THE WEB SERVER ---
 flask_app = Flask(__name__)
 @flask_app.route('/')
 def health_check():
@@ -27,12 +27,15 @@ def run_flask():
 
 # --- 2. THE TELEGRAM BOT LOGIC ---
 
-# === NEW: THE DOWNLOAD QUEUE ===
+# === NEW: THE DOWNLOAD QUEUE & A SEPARATE BOT INSTANCE FOR THE WORKER ===
 download_queue = Queue()
+# We build the application here to get the bot object for the worker
+application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+worker_bot = application.bot
 
 class ProgressCallbackFile:
-    def __init__(self, filepath, loop, context, chat_id, message_id):
-        self._filepath, self._loop, self._context = filepath, loop, context
+    def __init__(self, filepath, loop, bot, chat_id, message_id):
+        self._filepath, self._loop, self._bot = filepath, loop, bot
         self._chat_id, self._message_id = chat_id, message_id
         self._file = open(filepath, 'rb'); self._total_size = os.path.getsize(filepath)
         self._bytes_read, self._last_update_time = 0, 0
@@ -50,26 +53,25 @@ class ProgressCallbackFile:
             progress_bar = f"[{'█' * int(percent // 10)}{' ' * (10 - int(percent // 10))}]"
             read_mb = self._bytes_read / 1024 / 1024; total_mb = self._total_size / 1024 / 1024
             progress_text = (f"**Uploading...**\n{progress_bar} {percent:.1f}%\n📤 {read_mb:.2f}MB / {total_mb:.2f}MB")
-            await self._context.bot.edit_message_text(chat_id=self._chat_id, message_id=self._message_id, text=progress_text, parse_mode='Markdown')
+            await self._bot.edit_message_text(chat_id=self._chat_id, message_id=self._message_id, text=progress_text, parse_mode='Markdown')
         except Exception: pass
     def __getattr__(self, name): return getattr(self._file, name)
     def __len__(self): return self._total_size
     def close(self): self._file.close()
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    wel_msg = ("Welcome! Use /dl <URL> to download a song.\n (YoutubeMusic Links Aren't Supported)")
-    await update.message.reply_text(wel_msg, parse_mode='Markdown')
+    await update.message.reply_text("Welcome! Use /dl <URL> to download a song.")
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     help_text = ("🎵 **Available Command** 🎵\n\n`/dl <Spotify or YouTube URL>` - Downloads the audio (and lyrics if found).\n\n`/messageadmin <message>` - Send a message to the bot admin.")
     await update.message.reply_text(help_text, parse_mode='Markdown')
 async def message_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args: await update.message.reply_text("Please provide a message. Usage: /messageadmin <your message>"); return
+    if not context.args: await update.message.reply_text("Please provide a message."); return
     message_text = ' '.join(context.args); user_info = update.effective_user
-    forward_text = f"Message from user @{user_info.username} (ID: {user_info.id}):\n\n{message_text}"
-    try: await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=forward_text); await update.message.reply_text("Your message has been sent to the admin.")
-    except Exception as e: print(f"Error sending message to admin: {e}"); await update.message.reply_text("Sorry, I could not send your message.")
+    forward_text = f"Message from @{user_info.username} (ID: {user_info.id}):\n\n{message_text}"
+    try: await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=forward_text); await update.message.reply_text("Your message has been sent.")
+    except Exception as e: print(f"Error sending message to admin: {e}"); await update.message.reply_text("Could not send your message.")
 
-async def log_and_parse_stream(stream, context, chat_id, message_id):
+async def log_and_parse_stream(stream, bot, chat_id, message_id):
     last_update_time = 0
     while not stream.at_eof():
         line_bytes = await stream.readline();
@@ -83,38 +85,43 @@ async def log_and_parse_stream(stream, context, chat_id, message_id):
                 last_update_time = current_time; percent = float(match.group('percent'))
                 progress_bar = f"[{'█' * int(percent // 10)}{' ' * (10 - int(percent // 10))}]"
                 progress_text = (f"**Downloading...**\n{progress_bar} {percent:.1f}%\n📥 Size: {match.group('size')}\n⚡️ Speed: {match.group('speed')}\n⏳ ETA: {match.group('eta')}")
-                try: await context.bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=progress_text, parse_mode='Markdown')
+                try: await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=progress_text, parse_mode='Markdown')
                 except Exception: pass
 
 async def log_stderr_stream(stream):
+    full_error_log = []
     while not stream.at_eof():
         line_bytes = await stream.readline();
         if not line_bytes: break
         line = line_bytes.decode('utf-8', errors='ignore').strip()
         print(f"[SPOTDL_ERROR] {line}")
+        full_error_log.append(line)
+    return "\n".join(full_error_log)
 
-async def download_and_upload(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str):
-    status_message = await update.message.reply_text("🚀 Your request is in the queue...")
-    chat_id = update.effective_chat.id; files_before = set(os.listdir('.'))
+async def download_and_upload(bot: 'Bot', url: str, chat_id: int, message_id: int):
+    files_before = set(os.listdir('.'))
     try:
-        await context.bot.edit_message_text(chat_id=chat_id, message_id=status_message.message_id, text="🔥 Your download is starting now...")
+        await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text="🔥 Your download is starting now...")
         python_executable = sys.executable
-        # === NEW CPU-THROTTLED COMMAND ===
-        # We pass postprocessor args to yt-dlp to limit ffmpeg's threads
+        # The reliable command, including cookies
         command = (f'{python_executable} -m spotdl download "{url}" --lyrics genius --ignore-albums '
-                   '--format mp3 --bitrate 320k --no-cache '
-                   '--yt-dlp-args "--postprocessor-args \\"ffmpeg:-threads 1\\""')
+                   '--yt-dlp-args "--cookies cookies.txt" --format mp3 --bitrate 320k --no-cache')
         
         process = await asyncio.create_subprocess_shell(command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-        stdout_task = asyncio.create_task(log_and_parse_stream(process.stdout, context, chat_id, status_message.message_id))
+        stdout_task = asyncio.create_task(log_and_parse_stream(process.stdout, bot, chat_id, message_id))
         stderr_task = asyncio.create_task(log_stderr_stream(process.stderr))
-        await process.wait(); await asyncio.gather(stdout_task, stderr_task)
+        await process.wait()
+        error_log = await stderr_task
+        await stdout_task
 
-        if process.returncode != 0: await context.bot.edit_message_text(chat_id=chat_id, message_id=status_message.message_id, text="❌ Download failed. Check logs."); return
+        if process.returncode != 0:
+            error_snippet = f"\n\n`{error_log[-400:]}`" if error_log else ""
+            await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=f"❌ Download failed.{error_snippet}", parse_mode='Markdown'); return
+
         files_after = set(os.listdir('.')); new_files = files_after - files_before
         mp3_file_path = next((f for f in new_files if f.endswith('.mp3')), None)
         lrc_file_path = next((f for f in new_files if f.endswith('.lrc')), None)
-        if not mp3_file_path: await context.bot.edit_message_text(chat_id=chat_id, message_id=status_message.message_id, text="❌ MP3 file not found."); return
+        if not mp3_file_path: await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text="❌ MP3 file not found."); return
 
         try:
             audio = MP3(mp3_file_path); duration = int(audio.info.length)
@@ -122,13 +129,13 @@ async def download_and_upload(update: Update, context: ContextTypes.DEFAULT_TYPE
         except Exception as e: print(f"Mutagen error: {e}"); duration, title, artist = None, "Unknown", "Unknown"
         
         current_loop = asyncio.get_running_loop()
-        progress_wrapper_audio = ProgressCallbackFile(mp3_file_path, current_loop, context, chat_id, status_message.message_id)
-        try: await context.bot.send_audio(chat_id=chat_id, audio=progress_wrapper_audio, duration=duration, title=title, performer=artist)
+        progress_wrapper_audio = ProgressCallbackFile(mp3_file_path, current_loop, bot, chat_id, message_id)
+        try: await bot.send_audio(chat_id=chat_id, audio=progress_wrapper_audio, duration=duration, title=title, performer=artist)
         finally: progress_wrapper_audio.close()
         if lrc_file_path:
-            with open(lrc_file_path, 'rb') as lrc_file: await context.bot.send_document(chat_id=chat_id, document=lrc_file)
-        await context.bot.delete_message(chat_id=chat_id, message_id=status_message.message_id)
-    except Exception as e: print(f"Unexpected error: {e}"); await context.bot.edit_message_text(chat_id=chat_id, message_id=status_message.message_id, text="❌ An error occurred.")
+            with open(lrc_file_path, 'rb') as lrc_file: await bot.send_document(chat_id=chat_id, document=lrc_file)
+        await bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except Exception as e: print(f"Unexpected error: {e}"); await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text="❌ An error occurred.")
     finally:
         files_after_cleanup = set(os.listdir('.')); files_to_delete = files_after_cleanup - files_before
         for filename in files_to_delete:
@@ -137,27 +144,26 @@ async def download_and_upload(update: Update, context: ContextTypes.DEFAULT_TYPE
                 else: os.remove(filename)
             except OSError as e: print(f"Error deleting {filename}: {e}")
 
-# === NEW: DOWNLOAD WORKER THREAD ===
-def download_worker():
-    """Pulls tasks from the queue and executes them one by one."""
+# === MODIFIED: THE DOWNLOAD WORKER NOW GETS ITS OWN BOT INSTANCE ===
+def download_worker(bot: 'Bot'):
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     while True:
-        update, context, url = download_queue.get()
-        print(f"Worker starting new download for chat {update.effective_chat.id}")
-        loop.run_until_complete(download_and_upload(update, context, url))
+        url, chat_id, message_id = download_queue.get()
+        print(f"Worker starting download for chat {chat_id}")
+        loop.run_until_complete(download_and_upload(bot, url, chat_id, message_id))
         download_queue.task_done()
 
+# === MODIFIED: THE HANDLER ONLY PASSES DATA TO THE QUEUE ===
 async def download_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Adds a new download request to the queue."""
     if not context.args: await update.message.reply_text("Please provide a URL."); return
     url = context.args[0]
-    # Put the necessary objects into the queue
-    download_queue.put((update, context, url))
-    await update.message.reply_text("✅ Your request has been added to the download queue.")
+    # Send an initial message and get its ID
+    status_message = await update.message.reply_text("✅ Your request has been added to the download queue.")
+    # Put only the necessary DATA into the queue
+    download_queue.put((url, update.effective_chat.id, status_message.message_id))
 
 def run_bot():
-    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("messageadmin", message_admin))
@@ -167,15 +173,12 @@ def run_bot():
 
 # --- 3. THE MAIN STARTER ---
 if __name__ == '__main__':
-    # Start the Flask web server in a background thread
     flask_thread = threading.Thread(target=run_flask)
     flask_thread.daemon = True
     flask_thread.start()
 
-    # Start the single download worker in a background thread
-    worker_thread = threading.Thread(target=download_worker)
+    worker_thread = threading.Thread(target=download_worker, args=(worker_bot,))
     worker_thread.daemon = True
     worker_thread.start()
 
-    # Run the bot in the main thread
     run_bot()
