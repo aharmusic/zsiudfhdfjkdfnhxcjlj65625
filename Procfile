@@ -1,1 +1,1 @@
-web: python bot.py
+web: python -m spotdl --download-ffmpeg && python bot.py
